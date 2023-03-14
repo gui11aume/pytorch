@@ -6,7 +6,7 @@ import inspect
 import operator
 import re
 import types
-from typing import Any, NamedTuple, Optional, Union
+from typing import Any, NamedTuple, Optional, Set, Union
 
 import torch
 
@@ -35,6 +35,7 @@ from ..source import (
 )
 from ..utils import (
     clone_input,
+    dynamic_dims_from_tensor,
     get_fake_value,
     getfile,
     global_key_name,
@@ -805,7 +806,7 @@ class VariableBuilder:
                     shape_env.create_symbol(value, source=self.source), hint=value
                 )
                 self.tx.output.tracked_fakes.append(
-                    TrackedFake(wrapped_value, self.source)
+                    TrackedFake(wrapped_value, self.source, None)
                 )
             else:
                 wrapped_value = torch.tensor(value)
@@ -1053,15 +1054,30 @@ def wrap_fx_proxy_cls(
 class TrackedFake:
     fake: Union[FakeTensor, SymInt]
     source: Source
+    dynamic_ranges: Set[int]
 
 
 def wrap_to_fake_tensor_and_record(
     e, tx, ignore_subclass=False, *, source: Optional[Source], is_tensor: bool
 ):
+    from torch.fx.experimental.symbolic_shapes import DIM_DYNAMISM_STATE
+
     if type(e) in (torch.Tensor, torch.nn.Parameter) or (
         ignore_subclass and isinstance(e, torch.Tensor)
     ):
         static_shapes, reason = tensor_always_has_static_shape(e, source, is_tensor)
+
+        dynamic_ranges = None
+        if hasattr(e, "_dynamo_dynamic_ranges"):
+            dynamic_ranges = e._dynamo_dynamic_ranges
+            assert not static_shapes, tensor_static_reason_to_message(reason)
+
+        if not static_shapes:
+            dynamic_dims: List[DIM_DYNAMISM_STATE] = dynamic_dims_from_tensor(
+                e, dynamic_ranges
+            )
+        else:
+            dynamic_dims = None
 
         fake_e = wrap_fake_exception(
             lambda: tx.fake_mode.from_tensor(
@@ -1069,13 +1085,12 @@ def wrap_to_fake_tensor_and_record(
                 static_shapes=static_shapes,
                 ignore_subclass=ignore_subclass,
                 source=source,
+                dynamic_dims=dynamic_dims,
+                dynamic_dims_range=dynamic_ranges,
             )
         )
-        if hasattr(e, "_dynamo_dynamic_indices"):
-            fake_e._dynamo_dynamic_indices = e._dynamo_dynamic_indices
-            assert not static_shapes, tensor_static_reason_to_message(reason)
         if is_tensor:
-            tx.output.tracked_fakes.append(TrackedFake(fake_e, source))
+            tx.output.tracked_fakes.append(TrackedFake(fake_e, source, dynamic_ranges))
         return fake_e
     else:
         return e
