@@ -53,9 +53,9 @@ auto sum(int64_t N, Func f) {
   return partial_sums[0];
 }
 
-
 template <typename scalar_t, typename opmath_t>
-void gemm_notrans_(
+typename std::enable_if<!std::is_same<scalar_t, at::BFloat16>::value, void>::type
+gemm_notrans_(
     int64_t m, int64_t n, int64_t k,
     opmath_t alpha,
     const scalar_t *a, int64_t lda,
@@ -79,6 +79,36 @@ void gemm_notrans_(
       int64_t i = i_m * 4;
       for (; i < m; i++)
         c[j * ldc + i] += a[i + l * lda] * val;
+    }
+  }
+}
+
+template <typename scalar_t, typename opmath_t>
+typename std::enable_if<std::is_same<scalar_t, at::BFloat16>::value, void>::type
+gemm_notrans_(
+    int64_t m,
+    int64_t n,
+    int64_t k,
+    opmath_t alpha,
+    const scalar_t* a,
+    int64_t lda,
+    const scalar_t* b,
+    int64_t ldb,
+    opmath_t beta,
+    scalar_t* c,
+    int64_t ldc) {
+  // c += alpha * (a @ b)
+  for (const auto i : c10::irange(m)) {
+    for (const auto j : c10::irange(n)) {
+      const auto dot = sum(k, [&](int64_t l) -> opmath_t {
+        return static_cast<opmath_t>(a[l * lda + i]) *
+            static_cast<opmath_t>(b[j * ldb + l]);
+      });
+      if (beta == opmath_t(0)) {
+        c[j * ldc + i] = alpha * dot;
+      } else {
+        c[j * ldc + i] = beta * c[j * ldc + i] + alpha * dot;
+      }
     }
   }
 }
@@ -111,7 +141,8 @@ void gemm_transa_(
 }
 
 template <typename scalar_t, typename opmath_t>
-void gemm_transb_(
+typename std::enable_if<!std::is_same<scalar_t, at::BFloat16>::value, void>::type
+gemm_transb_(
     int64_t m, int64_t n, int64_t k,
     opmath_t alpha,
     const scalar_t *a, int64_t lda,
@@ -135,6 +166,36 @@ void gemm_transb_(
       int64_t i = i_m * 4;
       for (; i < m; i++)
         c[j * ldc + i] += a[i + l * lda] * val;
+    }
+  }
+}
+
+template <typename scalar_t, typename opmath_t>
+typename std::enable_if<std::is_same<scalar_t, at::BFloat16>::value, void>::type
+gemm_transb_(
+    int64_t m,
+    int64_t n,
+    int64_t k,
+    opmath_t alpha,
+    const scalar_t* a,
+    int64_t lda,
+    const scalar_t* b,
+    int64_t ldb,
+    opmath_t beta,
+    scalar_t* c,
+    int64_t ldc) {
+  // c += alpha * (a @ b.T)
+  for (const auto i : c10::irange(m)) {
+    for (const auto j : c10::irange(n)) {
+      const auto dot = sum(k, [&](int64_t l) -> opmath_t {
+        return static_cast<opmath_t>(a[l * lda + i]) *
+            static_cast<opmath_t>(b[l * ldb + j]);
+      });
+      if (beta == opmath_t(0)) {
+        c[j * ldc + i] = alpha * dot;
+      } else {
+        c[j * ldc + i] = beta * c[j * ldc + i] + alpha * dot;
+      }
     }
   }
 }
@@ -173,13 +234,19 @@ void gemm_core_(
     const scalar_t *b, int64_t ldb,
     opmath_t beta,
     scalar_t *c, int64_t ldc) {
-  if(transa == TransposeType::NoTranspose && transb == TransposeType::NoTranspose) {
+  if (transa == TransposeType::NoTranspose &&
+      transb == TransposeType::NoTranspose) {
     return gemm_notrans_(m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
-  } else if(transa == TransposeType::Transpose && transb != TransposeType::Transpose) {
+  } else if (
+      transa == TransposeType::Transpose &&
+      transb != TransposeType::Transpose) {
     gemm_transa_(m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
-  } else if(transa == TransposeType::NoTranspose && transb == TransposeType::Transpose) {
+  } else if (
+      transa == TransposeType::NoTranspose &&
+      transb == TransposeType::Transpose) {
     gemm_transb_(m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
-  } else {  // transa == TransposeType::Transpose && transb == TransposeType::Transpose
+  } else { // transa == TransposeType::Transpose && transb ==
+           // TransposeType::Transpose
     gemm_transab_(m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
   }
 }
