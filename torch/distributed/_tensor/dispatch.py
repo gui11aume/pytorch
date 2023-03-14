@@ -1,8 +1,10 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
-from typing import Callable, cast, Dict, Tuple, Union, Optional
+import functools
+from typing import Callable, cast, Dict, Tuple, Union, Optional, Sequence
 
 import torch
 
+import torch.distributed as dist
 import torch.distributed._tensor.api as dtensor
 from torch.distributed._tensor.op_schema import (
     ArgsType,
@@ -148,15 +150,115 @@ def operator_dispatch(
     suggested_input_schema = output_sharding.schema_suggestions[0]
     needs_redistribute = suggested_input_schema is not op_schema
 
+    def _arg_type_is_primitive(arg_type):
+        _python_primitive_types = [
+            "bool",
+            "int",
+            "float",
+            "double",
+        ]
+        return arg_type in _python_primitive_types
+
     if mesh is not None and mesh.get_coordinate() is None:
-        # if we are on a non-participating device, we simply return
-        # an empty tensor for now.
-        # TODO: what if the op returns a non-tensor value, what if
-        # the op returns a list of tensors, we need to figure out
-        # a consistent way to handle that, and also need to figure
-        # out if we should communicate the result to non-participating
-        # ranks (i.e. a.sum() -> scalar, maybe we should set to 0)
-        local_results = torch.tensor([])
+        # For a non-participating device, we do:
+        # 1. if the return type is scalar, all gather the local result
+        # from participating devices, and reduce on the list of results.
+        # For bool type, we by default use AND to reduce;
+        # For numeric type, we by default use ADD to reduce;
+        # We can extend this logic for specific ops if necessary.
+        # 2. if the return type is Tensor, return empty tensor with
+        # correct dtype.
+        # 3. if the return type is List[Tensor], return a list of empty
+        # tensors with correct dtype.
+
+        def _default_tensor(spec: Optional[DTensorSpec]):
+            assert spec is not None, (
+                f"expect DTensorSpec object but got {spec}"
+            )
+            if spec.tensor_meta is not None:
+                shape = spec.tensor_meta.shape
+                dtype = spec.tensor_meta.dtype
+                if len(shape) == 0:
+                    # scalar tensor
+                    return torch.zeros(
+                        (),
+                        dtype=dtype,
+                    )
+                else:
+                    # non-scalar tensor
+                    return torch.tensor(
+                        [],
+                        dtype=dtype,
+                    )
+            else:
+                raise RuntimeError(
+                    f"{spec} has no tensor metadata."
+                )
+
+        def _default_ret_value(arg):
+            type_str = str(arg.type)
+            if type_str == "()":  # used in aten function schema for None return value
+                return None
+
+            if _arg_type_is_primitive(type_str):
+                obj_list = [None for _ in range(dist.get_world_size())]
+                dist.all_gather_object(obj_list, None)
+                obj_list = list(filter(lambda x: x is not None, obj_list))
+                # TODO: this nested if-else statement is due to MYPY's
+                # issue on inferring reduce op's type. We have to explicitly
+                # type the lambda to make MYPY happy. But we better find a
+                # smarter way to do it.
+                if type_str == "bool":
+                    and_op: Callable[[bool, bool], bool] = lambda x, y: x and y
+                    return functools.reduce(and_op, obj_list, True)
+                elif type_str == "int":
+                    add_op: Callable[[int, int], int] = lambda x, y: x + y
+                    return functools.reduce(add_op, obj_list, 0)
+                elif type_str == "float":
+                    add_op: Callable[[float, float], float] = lambda x, y: x + y
+                    return functools.reduce(add_op, obj_list, 0.0)
+                elif type_str == "double":
+                    add_op: Callable[[double, double], double] = lambda x, y: x + y
+                    return functools.reduce(add_op, obj_list, 0.0)
+                else:
+                    raise NotImplementedError(
+                        f"Unsupported primitive type {type_str}."
+                    )
+
+            if type_str == "Tensor":
+                assert isinstance(output_sharding.output_spec, DTensorSpec), (
+                    f"output spec does not match with output! Expected "
+                    f"DTensorSpec, got {output_sharding.output_spec}"
+                )
+                return _default_tensor(output_sharding.output_spec)
+            elif type_str == "List[Tensor]":
+                assert isinstance(output_sharding.output_spec, Sequence), (
+                    f"output spec does not match with output! Expected "
+                    f"Sequence[DTensorSpec], got {output_sharding.output_spec}"
+                )
+                return [
+                    _default_tensor(spec)
+                    for spec in output_sharding.output_spec
+                ]
+            else:
+                # TODO: add more types
+                raise NotImplementedError(
+                    f"default value for type {type_str} on non-participating"
+                    f" device is not implemented."
+                )
+
+        ret_list = op_schema.func_schema.returns
+        if len(ret_list) == 1:
+            # return: scalar/torch.Tensor
+            local_results = _default_ret_value(ret_list[0])
+        elif len(ret_list) > 1:
+            # return: List[torch.Tensor]
+            local_results = [_default_ret_value(arg) for arg in ret_list]
+        else:
+            raise RuntimeError(
+                f"function schema {str(op_schema.func_schema)} has"
+                f" no return type"
+            )
     else:
         # compute locally with redistribute first if needed
         local_tensor_args = pack_args_kwargs_with_local_tensor(
@@ -174,6 +276,19 @@ def operator_dispatch(
         local_tensor_args = cast(Tuple[object, ...], local_tensor_args)
         local_tensor_kwargs = cast(Dict[str, object], local_tensor_kwargs)
         local_results = op_call(*local_tensor_args, **local_tensor_kwargs)
+        if (
+            (mesh is not None)
+            and (mesh.mesh.numel() < dist.get_world_size())
+        ):
+            # communicate the result to non-participating ranks if
+            # op runs on a submesh and return type is scalar value
+            ret_list = op_schema.func_schema.returns
+            if (
+                (len(ret_list) == 1)
+                and (_arg_type_is_primitive(str(ret_list[0].type)))
+            ):
+                obj_list = [None for _ in range(dist.get_world_size())]
+                dist.all_gather_object(obj_list, local_results)
 
     if suggested_input_schema.is_inplace:
         # inplace op should return self instead of re-wrapping
